@@ -80,10 +80,10 @@ const validateAddresses = (): void => {
  * Validate numeric configuration values
  */
 const validateNumericConfig = (): void => {
-    const fetchInterval = parseInt(process.env.FETCH_INTERVAL || '1', 10);
+    const fetchInterval = parseFloat(process.env.FETCH_INTERVAL || '1');
     if (isNaN(fetchInterval) || fetchInterval <= 0) {
         throw new Error(
-            `Invalid FETCH_INTERVAL: ${process.env.FETCH_INTERVAL}. Must be a positive integer.`
+            `Invalid FETCH_INTERVAL: ${process.env.FETCH_INTERVAL}. Must be a positive number.`
         );
     }
 
@@ -94,10 +94,10 @@ const validateNumericConfig = (): void => {
         );
     }
 
-    const tooOldTimestamp = parseInt(process.env.TOO_OLD_TIMESTAMP || '24', 10);
-    if (isNaN(tooOldTimestamp) || tooOldTimestamp < 1) {
+    const tooOldSeconds = parseInt(process.env.TOO_OLD_SECONDS || '120', 10);
+    if (isNaN(tooOldSeconds) || tooOldSeconds < 1) {
         throw new Error(
-            `Invalid TOO_OLD_TIMESTAMP: ${process.env.TOO_OLD_TIMESTAMP}. Must be a positive integer (hours).`
+            `Invalid TOO_OLD_SECONDS: ${process.env.TOO_OLD_SECONDS}. Must be a positive integer (seconds).`
         );
     }
 
@@ -328,8 +328,8 @@ export const ENV = {
     PRIVATE_KEY: process.env.PRIVATE_KEY as string,
     CLOB_HTTP_URL: process.env.CLOB_HTTP_URL as string,
     CLOB_WS_URL: process.env.CLOB_WS_URL as string,
-    FETCH_INTERVAL: parseInt(process.env.FETCH_INTERVAL || '1', 10),
-    TOO_OLD_TIMESTAMP: parseInt(process.env.TOO_OLD_TIMESTAMP || '24', 10),
+    FETCH_INTERVAL: parseFloat(process.env.FETCH_INTERVAL || '1'),
+    TOO_OLD_SECONDS: parseInt(process.env.TOO_OLD_SECONDS || '120', 10),
     RETRY_LIMIT: parseInt(process.env.RETRY_LIMIT || '3', 10),
     // Legacy parameters (kept for backward compatibility)
     TRADE_MULTIPLIER: parseFloat(process.env.TRADE_MULTIPLIER || '1.0'),
@@ -345,6 +345,9 @@ export const ENV = {
         process.env.TRADE_AGGREGATION_WINDOW_SECONDS || '300',
         10
     ), // 5 minutes default
+    // Paper trading settings (in-memory simulation)
+    PAPER_TRADING_ENABLED: process.env.PAPER_TRADING_ENABLED === 'true',
+    PAPER_TRADING_BALANCE_USD: parseFloat(process.env.PAPER_TRADING_BALANCE_USD || '1000'),
     MONGO_URI: process.env.MONGO_URI as string,
     RPC_URL: process.env.RPC_URL as string,
     USDC_CONTRACT_ADDRESS: process.env.USDC_CONTRACT_ADDRESS as string,

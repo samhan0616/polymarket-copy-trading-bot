@@ -16,6 +16,7 @@
         "sell-large": "ts-node src/scripts/sellLargePositions.ts",
         "transfer-to-gnosis": "ts-node src/scripts/transferPositionsToGnosisSafe.ts",
         "fetch-history": "ts-node src/scripts/fetchHistoricalTrades.ts",
+        "download-history-csv": "ts-node src/scripts/downloadHistoricalTradesCsv.ts",
         "simulate": "ts-node src/scripts/simulateProfitability.ts",
         "simulate-old": "ts-node src/scripts/simulateProfitabilityOldLogic.ts",
         "sim": "ts-node src/scripts/runSimulations.ts",
@@ -66,12 +67,14 @@
         "typescript-eslint": "^8.23.0"
     },
     "dependencies": {
-        "@polymarket/clob-client": "^4.14.0",
+        "@polymarket/clob-client": "^5.1.2",
         "axios": "^1.7.9",
         "chalk": "^5.4.1",
+        "csv-writer": "^1.6.0",
         "dotenv": "^16.4.7",
         "ethers": "^5.8.0",
         "moment": "^2.30.1",
+        "moment-timezone": "^0.6.0",
         "mongoose": "^8.9.5",
         "ora": "^8.2.0"
     }

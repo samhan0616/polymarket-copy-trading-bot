@@ -343,7 +343,7 @@ MIN_ORDER_SIZE_USD='${config.MIN_ORDER_SIZE_USD}'
 # ================================================================
 FETCH_INTERVAL='${config.FETCH_INTERVAL || '1'}'
 RETRY_LIMIT='${config.RETRY_LIMIT || '3'}'
-TOO_OLD_TIMESTAMP='24'
+TOO_OLD_MINUTES='2'
 
 # ================================================================
 # TRADE AGGREGATION

@@ -4,7 +4,7 @@ import fetchData from '../utils/fetchData';
 import Logger from '../utils/logger';
 
 const USER_ADDRESSES = ENV.USER_ADDRESSES;
-const TOO_OLD_TIMESTAMP = ENV.TOO_OLD_TIMESTAMP;
+const TOO_OLD_SECONDS = ENV.TOO_OLD_SECONDS;
 const FETCH_INTERVAL = ENV.FETCH_INTERVAL;
 
 if (!USER_ADDRESSES || USER_ADDRESSES.length === 0) {
@@ -108,9 +108,14 @@ const init = async () => {
 const fetchTradeData = async () => {
     for (const { address, UserActivity, UserPosition } of userModels) {
         try {
-            // Fetch trade activities from Polymarket API
-            const apiUrl = `https://data-api.polymarket.com/activity?user=${address}&type=TRADE`;
+            console.info('Trade timestamp:', new Date().toISOString());
+            // Fetch trade activities from Polymarket API (last 1 minute)
+            const startTs = Math.floor((Date.now() - 60000) / 1000); // 1 minute ago in seconds
+            const apiUrl = `https://data-api.polymarket.com/activity?user=${address}&type=TRADE&sortBy=TIMESTAMP`;
+            console.info('Fetching URL:', apiUrl);  
             const activities = await fetchData(apiUrl);
+
+            console.info(`Fetched ${Array.isArray(activities) ? activities.length : 0} activities for ${address.slice(0, 6)}...${address.slice(-4)}`);
 
             if (!Array.isArray(activities) || activities.length === 0) {
                 continue;
@@ -119,10 +124,24 @@ const fetchTradeData = async () => {
             // Process each activity
             for (const activity of activities) {
                 // Skip if too old
-                if (activity.timestamp < TOO_OLD_TIMESTAMP) {
+                // `TOO_OLD_SECONDS` is expressed in seconds (ENV). `activity.timestamp`
+                // from the API is an epoch (seconds or milliseconds) or ISO string.
+                // Convert `activity.timestamp` to milliseconds then compare age.
+                const nowMs = Date.now();
+                let activityMs = 0;
+                if (typeof activity.timestamp === 'number') {
+                    // heuristic: values > 1e12 are ms, otherwise seconds
+                    activityMs = activity.timestamp > 1e12 ? activity.timestamp : activity.timestamp * 1000;
+                } else if (typeof activity.timestamp === 'string') {
+                    const parsed = Date.parse(activity.timestamp);
+                    activityMs = isNaN(parsed) ? 0 : parsed;
+                }
+                const tooOldMs = TOO_OLD_SECONDS * 1000; // seconds -> ms
+                console.info('latency :', (nowMs - activityMs) / 1000, 'seconds');
+                if (activityMs === 0 || nowMs - activityMs > tooOldMs) {
+                    // unknown timestamp or older than threshold
                     continue;
                 }
-
                 // Check if this trade already exists in database
                 const existingActivity = await UserActivity.findOne({
                     transactionHash: activity.transactionHash,
@@ -133,6 +152,7 @@ const fetchTradeData = async () => {
                 }
 
                 // Save new trade to database
+              
                 const newActivity = new UserActivity({
                     proxyWallet: activity.proxyWallet,
                     timestamp: activity.timestamp,

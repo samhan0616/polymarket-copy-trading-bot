@@ -13,6 +13,8 @@ const PROXY_WALLET = ENV.PROXY_WALLET;
 const TRADE_AGGREGATION_ENABLED = ENV.TRADE_AGGREGATION_ENABLED;
 const TRADE_AGGREGATION_WINDOW_SECONDS = ENV.TRADE_AGGREGATION_WINDOW_SECONDS;
 const TRADE_AGGREGATION_MIN_TOTAL_USD = 1.0; // Polymarket minimum
+const PAPER_TRADING_ENABLED = ENV.PAPER_TRADING_ENABLED;
+const PAPER_TRADING_BALANCE_USD = ENV.PAPER_TRADING_BALANCE_USD;
 
 // Create activity models for each user
 const userActivityModels = USER_ADDRESSES.map((address) => ({
@@ -63,6 +65,69 @@ const readTempTrades = async (): Promise<TradeWithUser[]> => {
 
     return allTrades;
 };
+
+/** Simple in-memory paper trader for simulating USDC balance and positions */
+class PaperTrader {
+    balance: number;
+    // store minimal position info keyed by conditionId
+    positions: Map<string, { conditionId: string; asset: string; size: number; invested: number; avgPrice: number }>;
+
+    constructor(initialUsd: number) {
+        this.balance = initialUsd;
+        this.positions = new Map();
+    }
+
+    getBalance(): number {
+        return this.balance;
+    }
+
+    executeTrade(trade: TradeWithUser | UserActivityInterface): boolean {
+        const usdc = trade.usdcSize || 0;
+        const size = (trade as any).size || 0;
+        const price = (trade as any).price || 0;
+        const cid = (trade as any).conditionId;
+
+        if ((trade as any).side === 'BUY') {
+            if (this.balance < usdc) {
+                Logger.info(`Paper-trade: Insufficient balance for BUY $${usdc.toFixed(2)} — balance $${this.balance.toFixed(2)}`);
+                return false; // Skip trade
+            }
+            this.balance -= usdc;
+            const existing = this.positions.get(cid) || { conditionId: cid, asset: (trade as any).asset || '', size: 0, invested: 0, avgPrice: 0 };
+            existing.size += size;
+            existing.invested += usdc;
+            existing.avgPrice = existing.size > 0 ? existing.invested / existing.size : price;
+            this.positions.set(cid, existing);
+        } else {
+            // SELL
+            const existing = this.positions.get(cid);
+            if (!existing || existing.size < size) {
+                Logger.info(`Paper-trade: Insufficient position for SELL ${size} units — held ${existing?.size || 0}`);
+                return false; // Skip trade
+            }
+            this.balance += usdc;
+            existing.size -= size;
+            existing.invested -= usdc;
+            if (existing.size === 0) this.positions.delete(cid);
+            else this.positions.set(cid, existing);
+        }
+
+        Logger.info(
+            `Paper-trade: ${(trade as any).side} $${usdc.toFixed(2)} — balance $${this.balance.toFixed(2)}`
+        );
+        return true; // Trade executed
+    }
+
+    getUserPortfolioValue(): number {
+        // conservative: treat invested as current value
+        let total = 0;
+        for (const p of this.positions.values()) total += p.invested || 0;
+        return total;
+    }
+}
+
+// instantiate paper trader if enabled
+const paperTrader = PAPER_TRADING_ENABLED ? new PaperTrader(PAPER_TRADING_BALANCE_USD) : null;
 
 /**
  * Generate a unique key for trade aggregation based on user, market, side
@@ -146,6 +211,11 @@ const getReadyAggregatedTrades = (): AggregatedTrade[] => {
 
 const doTrading = async (clobClient: ClobClient, trades: TradeWithUser[]) => {
     for (const trade of trades) {
+        // Calculate latency from trader's trade timestamp to execution
+        const traderTimestampMs = trade.timestamp > 1e12 ? trade.timestamp : trade.timestamp * 1000;
+        const latencyMs = Date.now() - traderTimestampMs;
+        Logger.info(`Trade latency: ${latencyMs} ms (from trader's trade to execution)`);
+
         // Mark trade as being processed immediately to prevent duplicate processing
         const UserActivity = getUserActivityModel(trade.userAddress);
         await UserActivity.updateOne({ _id: trade._id }, { $set: { botExcutedTime: 1 } });
@@ -160,40 +230,50 @@ const doTrading = async (clobClient: ClobClient, trades: TradeWithUser[]) => {
             transactionHash: trade.transactionHash,
         });
 
-        const my_positions: UserPositionInterface[] = await fetchData(
-            `https://data-api.polymarket.com/positions?user=${PROXY_WALLET}`
-        );
-        const user_positions: UserPositionInterface[] = await fetchData(
-            `https://data-api.polymarket.com/positions?user=${trade.userAddress}`
-        );
-        const my_position = my_positions.find(
-            (position: UserPositionInterface) => position.conditionId === trade.conditionId
-        );
-        const user_position = user_positions.find(
-            (position: UserPositionInterface) => position.conditionId === trade.conditionId
-        );
+        // If paper trading enabled, simulate trade against in-memory balance instead of calling APIs
+        if (PAPER_TRADING_ENABLED && paperTrader) {
+            const my_balance = paperTrader.getBalance();
+            const user_balance = paperTrader.getUserPortfolioValue();
+            Logger.balance(my_balance, user_balance, trade.userAddress);
+            const executed = paperTrader.executeTrade(trade);
+            if (!executed) {
+                // Mark as skipped (not executed)
+                await UserActivity.updateOne({ _id: trade._id }, { $set: { botExcutedTime: 999 } });
+                continue; // Skip to next trade
+            }
+        } else {
+            // Parallel fetch positions and balance to reduce latency
+            const [my_positions, user_positions, my_balance] = await Promise.all([
+                fetchData(`https://data-api.polymarket.com/positions?user=${PROXY_WALLET}`),
+                fetchData(`https://data-api.polymarket.com/positions?user=${trade.userAddress}`),
+                getMyBalance(PROXY_WALLET)
+            ]);
+            const my_position = my_positions.find(
+                (position: UserPositionInterface) => position.conditionId === trade.conditionId
+            );
+            const user_position = user_positions.find(
+                (position: UserPositionInterface) => position.conditionId === trade.conditionId
+            );
 
-        // Get USDC balance
-        const my_balance = await getMyBalance(PROXY_WALLET);
+            // Calculate trader's total portfolio value from positions
+            const user_balance = user_positions.reduce((total: number, pos: UserPositionInterface) => {
+                return total + (pos.currentValue || 0);
+            }, 0);
 
-        // Calculate trader's total portfolio value from positions
-        const user_balance = user_positions.reduce((total, pos) => {
-            return total + (pos.currentValue || 0);
-        }, 0);
+            Logger.balance(my_balance, user_balance, trade.userAddress);
 
-        Logger.balance(my_balance, user_balance, trade.userAddress);
-
-        // Execute the trade
-        await postOrder(
-            clobClient,
-            trade.side === 'BUY' ? 'buy' : 'sell',
-            my_position,
-            user_position,
-            trade,
-            my_balance,
-            user_balance,
-            trade.userAddress
-        );
+            // Execute the trade
+            await postOrder(
+                clobClient,
+                trade.side === 'BUY' ? 'buy' : 'sell',
+                my_position,
+                user_position,
+                trade,
+                my_balance,
+                user_balance,
+                trade.userAddress
+            );
+        }
 
         Logger.separator();
     }
@@ -210,18 +290,24 @@ const doAggregatedTrading = async (clobClient: ClobClient, aggregatedTrades: Agg
         Logger.info(`Total volume: $${agg.totalUsdcSize.toFixed(2)}`);
         Logger.info(`Average price: $${agg.averagePrice.toFixed(4)}`);
 
+        // Calculate latency from first trader's trade timestamp to execution
+        const firstTrade = agg.trades[0];
+        const traderTimestampMs = firstTrade.timestamp > 1e12 ? firstTrade.timestamp : firstTrade.timestamp * 1000;
+        const latencyMs = Date.now() - traderTimestampMs;
+        Logger.info(`Aggregated trade latency: ${latencyMs} ms (from first trader's trade to execution)`);
+
         // Mark all individual trades as being processed
         for (const trade of agg.trades) {
             const UserActivity = getUserActivityModel(trade.userAddress);
             await UserActivity.updateOne({ _id: trade._id }, { $set: { botExcutedTime: 1 } });
         }
 
-        const my_positions: UserPositionInterface[] = await fetchData(
-            `https://data-api.polymarket.com/positions?user=${PROXY_WALLET}`
-        );
-        const user_positions: UserPositionInterface[] = await fetchData(
-            `https://data-api.polymarket.com/positions?user=${agg.userAddress}`
-        );
+        // Parallel fetch positions and balance to reduce latency
+        const [my_positions, user_positions, my_balance] = await Promise.all([
+            fetchData(`https://data-api.polymarket.com/positions?user=${PROXY_WALLET}`),
+            fetchData(`https://data-api.polymarket.com/positions?user=${agg.userAddress}`),
+            getMyBalance(PROXY_WALLET)
+        ]);
         const my_position = my_positions.find(
             (position: UserPositionInterface) => position.conditionId === agg.conditionId
         );
@@ -229,11 +315,8 @@ const doAggregatedTrading = async (clobClient: ClobClient, aggregatedTrades: Agg
             (position: UserPositionInterface) => position.conditionId === agg.conditionId
         );
 
-        // Get USDC balance
-        const my_balance = await getMyBalance(PROXY_WALLET);
-
         // Calculate trader's total portfolio value from positions
-        const user_balance = user_positions.reduce((total, pos) => {
+        const user_balance = user_positions.reduce((total: number, pos: UserPositionInterface) => {
             return total + (pos.currentValue || 0);
         }, 0);
 
