@@ -19,7 +19,6 @@ const validateRequiredEnv = (): void => {
         'PRIVATE_KEY',
         'CLOB_HTTP_URL',
         'CLOB_WS_URL',
-        'MONGO_URI',
         'RPC_URL',
         'USDC_CONTRACT_ADDRESS',
     ];
@@ -101,6 +100,20 @@ const validateNumericConfig = (): void => {
         );
     }
 
+    const executorWorkers = parseInt(process.env.EXECUTOR_WORKERS || '2', 10);
+    if (isNaN(executorWorkers) || executorWorkers < 1 || executorWorkers > 32) {
+        throw new Error(
+            `Invalid EXECUTOR_WORKERS: ${process.env.EXECUTOR_WORKERS}. Must be between 1 and 32.`
+        );
+    }
+
+    const dedupCacheTtlSeconds = parseInt(process.env.DEDUP_CACHE_TTL_SECONDS || '600', 10);
+    if (isNaN(dedupCacheTtlSeconds) || dedupCacheTtlSeconds < 30) {
+        throw new Error(
+            `Invalid DEDUP_CACHE_TTL_SECONDS: ${process.env.DEDUP_CACHE_TTL_SECONDS}. Must be at least 30 seconds.`
+        );
+    }
+
     const requestTimeout = parseInt(process.env.REQUEST_TIMEOUT_MS || '10000', 10);
     if (isNaN(requestTimeout) || requestTimeout < 1000) {
         throw new Error(
@@ -152,21 +165,6 @@ const validateUrls = (): void => {
         throw new Error(`Invalid RPC_URL: ${process.env.RPC_URL}. Must be a valid HTTP/HTTPS URL.`);
     }
 
-    if (process.env.MONGO_URI && !process.env.MONGO_URI.startsWith('mongodb')) {
-        console.error('\n❌ Invalid MONGO_URI\n');
-        console.error(`Current value: ${process.env.MONGO_URI}`);
-        console.error('Must start with: mongodb:// or mongodb+srv://\n');
-        console.error('💡 Setup MongoDB Atlas (free):');
-        console.error('   1. Visit https://www.mongodb.com/cloud/atlas/register');
-        console.error('   2. Create a free cluster');
-        console.error('   3. Create database user with password');
-        console.error('   4. Whitelist IP: 0.0.0.0/0 (or your IP)');
-        console.error('   5. Get connection string from "Connect" button\n');
-        console.error('Example: mongodb+srv://username:password@cluster.mongodb.net/database\n');
-        throw new Error(
-            `Invalid MONGO_URI: ${process.env.MONGO_URI}. Must be a valid MongoDB connection string.`
-        );
-    }
 };
 
 // Run all validations
@@ -348,7 +346,8 @@ export const ENV = {
     // Paper trading settings (in-memory simulation)
     PAPER_TRADING_ENABLED: process.env.PAPER_TRADING_ENABLED === 'true',
     PAPER_TRADING_BALANCE_USD: parseFloat(process.env.PAPER_TRADING_BALANCE_USD || '1000'),
-    MONGO_URI: process.env.MONGO_URI as string,
+    EXECUTOR_WORKERS: parseInt(process.env.EXECUTOR_WORKERS || '2', 10),
+    DEDUP_CACHE_TTL_SECONDS: parseInt(process.env.DEDUP_CACHE_TTL_SECONDS || '600', 10),
     RPC_URL: process.env.RPC_URL as string,
     USDC_CONTRACT_ADDRESS: process.env.USDC_CONTRACT_ADDRESS as string,
 };

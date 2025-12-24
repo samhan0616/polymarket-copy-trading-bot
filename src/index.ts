@@ -1,4 +1,3 @@
-import connectDB, { closeDB } from './config/db';
 import { ENV } from './config/env';
 import createClobClient from './utils/createClobClient';
 import tradeExecutor, { stopTradeExecutor } from './services/tradeExecutor';
@@ -31,9 +30,6 @@ const gracefulShutdown = async (signal: string) => {
         // Give services time to finish current operations
         Logger.info('Waiting for services to finish current operations...');
         await new Promise((resolve) => setTimeout(resolve, 2000));
-
-        // Close database connection
-        await closeDB();
 
         Logger.success('Graceful shutdown completed');
         process.exit(0);
@@ -75,7 +71,6 @@ export const main = async () => {
         console.log(`   Read the guide: ${colors.cyan}GETTING_STARTED.md${colors.reset}`);
         console.log(`   Run health check: ${colors.cyan}npm run health-check${colors.reset}\n`);
         
-        await connectDB();
         Logger.startup(USER_ADDRESSES, PROXY_WALLET);
 
         // Perform initial health check

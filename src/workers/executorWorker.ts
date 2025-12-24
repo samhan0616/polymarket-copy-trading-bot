@@ -1,67 +1,21 @@
+import { parentPort, workerData } from 'worker_threads';
 import { ClobClient } from '@polymarket/clob-client';
-import { UserActivityInterface, UserPositionInterface } from '../interfaces/User';
-import { ENV } from '../config/env';
+import createClobClient from '../utils/createClobClient';
 import fetchData from '../utils/fetchData';
 import getMyBalance from '../utils/getMyBalance';
 import postOrder from '../utils/postOrder';
 import Logger from '../utils/logger';
-import { activityQueue, QueueActivity } from './activityQueue';
-import path from 'path';
-import { Worker } from 'worker_threads';
-import { registerWorkerEndpoint, unregisterWorkerEndpoint, broadcastShutdown } from './activityDistributor';
+import { ENV } from '../config/env';
+import { QueueActivity } from '../services/activityQueue';
+import { UserActivityInterface, UserPositionInterface } from '../interfaces/User';
 
-const USER_ADDRESSES = ENV.USER_ADDRESSES;
 const PROXY_WALLET = ENV.PROXY_WALLET;
 const TRADE_AGGREGATION_ENABLED = ENV.TRADE_AGGREGATION_ENABLED;
 const TRADE_AGGREGATION_WINDOW_SECONDS = ENV.TRADE_AGGREGATION_WINDOW_SECONDS;
-const TRADE_AGGREGATION_MIN_TOTAL_USD = 1.0; // Polymarket minimum
+const TRADE_AGGREGATION_MIN_TOTAL_USD = 1.0;
 const PAPER_TRADING_ENABLED = ENV.PAPER_TRADING_ENABLED;
 const PAPER_TRADING_BALANCE_USD = ENV.PAPER_TRADING_BALANCE_USD;
-const EXECUTOR_WORKERS = Math.max(1, ENV.EXECUTOR_WORKERS || 1);
-const QUEUE_POLL_INTERVAL_MS = 500;
 const AGGREGATION_CHECK_INTERVAL_MS = 500;
-
-const workers: Worker[] = [];
-
-// E2E Latency profiling
-interface LatencyRecord {
-    txHash: string;
-    detectionLatencyMs: number;
-    e2eLatencyMs: number;
-    timestamp: number;
-}
-const latencyRecords: LatencyRecord[] = [];
-const MAX_LATENCY_RECORDS = 1000;
-
-const recordLatency = (txHash: string, detectionLatencyMs: number | null, e2eLatencyMs: number) => {
-    if (detectionLatencyMs === null) return;
-    latencyRecords.push({ txHash, detectionLatencyMs, e2eLatencyMs, timestamp: Date.now() });
-    if (latencyRecords.length > MAX_LATENCY_RECORDS) {
-        latencyRecords.shift();
-    }
-};
-
-const getLatencyStats = () => {
-    if (latencyRecords.length === 0) return null;
-    
-    const detectionLatencies = latencyRecords.map(r => r.detectionLatencyMs);
-    const e2eLatencies = latencyRecords.map(r => r.e2eLatencyMs);
-    
-    const calcStats = (values: number[]) => {
-        const sorted = [...values].sort((a, b) => a - b);
-        const avg = values.reduce((a, b) => a + b, 0) / values.length;
-        const p50 = sorted[Math.floor(sorted.length * 0.5)];
-        const p95 = sorted[Math.floor(sorted.length * 0.95)];
-        const p99 = sorted[Math.floor(sorted.length * 0.99)];
-        return { min: sorted[0], p50, p95, p99, max: sorted[sorted.length - 1], avg };
-    };
-    
-    return {
-        count: latencyRecords.length,
-        detection: calcStats(detectionLatencies),
-        e2e: calcStats(e2eLatencies),
-    };
-};
 
 interface AggregatedTrade {
     userAddress: string;
@@ -77,10 +31,8 @@ interface AggregatedTrade {
     lastTradeTime: number;
 }
 
-// Buffer for aggregating trades
 const tradeAggregationBuffer: Map<string, AggregatedTrade> = new Map();
 
-/** Simple in-memory paper trader for simulating USDC balance and positions */
 class PaperTrader {
     balance: number;
     positions: Map<string, { conditionId: string; asset: string; size: number; invested: number; avgPrice: number }>;
@@ -194,14 +146,15 @@ const getReadyAggregatedTrades = (): AggregatedTrade[] => {
 
 const doTrading = async (clobClient: ClobClient, trades: QueueActivity[], workerLabel: string) => {
     for (const trade of trades) {
+        const receivedAt = Date.now();
         const traderTimestampMs = trade.timestamp > 1e12 ? trade.timestamp : trade.timestamp * 1000;
-        const executionTime = Date.now();
-        const e2eLatencyMs = executionTime - traderTimestampMs;
-        const detectionLatencyMs = (trade as any)._detectedAt ? executionTime - (trade as any)._detectedAt : null;
+        const detectedAt = (trade as any)._detectedAt || receivedAt;
         
-        Logger.info(`[${workerLabel}] === E2E LATENCY PROFILE === | TxHash: ${trade.transactionHash?.slice(0, 10)}... | Detection→Execution: ${detectionLatencyMs}ms | Activity Timestamp→Execution: ${e2eLatencyMs}ms`);
-
-        recordLatency(trade.transactionHash || 'unknown', detectionLatencyMs, e2eLatencyMs);
+        const totalLatency = receivedAt - traderTimestampMs;
+        const queueLatency = receivedAt - detectedAt;
+        
+        Logger.info(`[${workerLabel}] ⏱️  LATENCY BREAKDOWN | TxHash: ${trade.transactionHash?.slice(0, 10)}...`);
+        Logger.info(`[${workerLabel}]   Activity→Now: ${totalLatency}ms | Detection→Receipt: ${queueLatency}ms`);
 
         Logger.trade(trade.userAddress, trade.side || 'UNKNOWN', {
             asset: trade.asset,
@@ -211,8 +164,6 @@ const doTrading = async (clobClient: ClobClient, trades: QueueActivity[], worker
             slug: trade.slug,
             eventSlug: trade.eventSlug,
             transactionHash: trade.transactionHash,
-            detectionLatencyMs,
-            e2eLatencyMs,
         });
 
         if (PAPER_TRADING_ENABLED && paperTrader) {
@@ -224,11 +175,15 @@ const doTrading = async (clobClient: ClobClient, trades: QueueActivity[], worker
                 continue;
             }
         } else {
+            const fetchStart = Date.now();
             const [my_positions, user_positions, my_balance] = await Promise.all([
                 fetchData(`https://data-api.polymarket.com/positions?user=${PROXY_WALLET}`),
                 fetchData(`https://data-api.polymarket.com/positions?user=${trade.userAddress}`),
                 getMyBalance(PROXY_WALLET)
             ]);
+            const fetchLatency = Date.now() - fetchStart;
+            Logger.info(`[${workerLabel}]   API fetch (positions + balance): ${fetchLatency}ms`);
+            
             const my_position = my_positions.find(
                 (position: UserPositionInterface) => position.conditionId === trade.conditionId
             );
@@ -242,6 +197,7 @@ const doTrading = async (clobClient: ClobClient, trades: QueueActivity[], worker
 
             Logger.balance(my_balance, user_balance, trade.userAddress);
 
+            const orderStart = Date.now();
             await postOrder(
                 clobClient,
                 trade.side === 'BUY' ? 'buy' : 'sell',
@@ -252,6 +208,11 @@ const doTrading = async (clobClient: ClobClient, trades: QueueActivity[], worker
                 user_balance,
                 trade.userAddress
             );
+            const orderLatency = Date.now() - orderStart;
+            const executionLatency = Date.now() - receivedAt;
+            
+            Logger.info(`[${workerLabel}]   Order placement: ${orderLatency}ms | Total execution: ${executionLatency}ms`);
+            Logger.info(`[${workerLabel}]   🏁 TOTAL E2E: ${Date.now() - traderTimestampMs}ms (Activity→Order Complete)`);
         }
 
         Logger.separator();
@@ -268,10 +229,8 @@ const doAggregatedTrading = async (clobClient: ClobClient, aggregatedTrades: Agg
 
         const firstTrade = agg.trades[0];
         const traderTimestampMs = firstTrade.timestamp > 1e12 ? firstTrade.timestamp : firstTrade.timestamp * 1000;
-        const executionTime = Date.now();
-        const e2eLatencyMs = executionTime - traderTimestampMs;
-        const detectionLatencyMs = (firstTrade as any)._detectedAt ? executionTime - (firstTrade as any)._detectedAt : null;
-        Logger.info(`[AGGREGATED] === E2E LATENCY === | First Trade TxHash: ${firstTrade.transactionHash?.slice(0, 10)}... | Detection→Execution: ${detectionLatencyMs}ms | Activity→Execution: ${e2eLatencyMs}ms`);
+        const latencyMs = Date.now() - traderTimestampMs;
+        Logger.info(`Aggregated trade latency: ${latencyMs} ms (from first trader's trade to execution)`);
 
         const [my_positions, user_positions, my_balance] = await Promise.all([
             fetchData(`https://data-api.polymarket.com/positions?user=${PROXY_WALLET}`),
@@ -316,6 +275,7 @@ const doAggregatedTrading = async (clobClient: ClobClient, aggregatedTrades: Agg
 let isRunning = true;
 let aggregationTimer: NodeJS.Timeout | null = null;
 let aggregationFlushInProgress = false;
+const workerLabel: string = `executor-${workerData?.workerId || 0}`;
 
 const startAggregationFlusher = (clobClient: ClobClient) => {
     if (!TRADE_AGGREGATION_ENABLED || aggregationTimer) return;
@@ -347,100 +307,60 @@ const stopAggregationFlusher = () => {
     }
 };
 
-const runExecutorWorker = async (workerId: number, clobClient: ClobClient) => {
-    const workerLabel = `executor-${workerId}`;
-    Logger.success(`Trade executor worker #${workerId} running`);
+const localQueue: QueueActivity[] = [];
 
-    let lastWaitingLog = 0;
-
+const dequeueLoop = async (clobClient: ClobClient) => {
     while (isRunning) {
-        const trade = await activityQueue.dequeue({ timeoutMs: QUEUE_POLL_INTERVAL_MS });
-        if (!isRunning) break;
-
-        if (!trade) {
-            const now = Date.now();
-            if (now - lastWaitingLog > 1000) {
-                Logger.waiting(
-                    USER_ADDRESSES.length,
-                    `queue:${activityQueue.size()} buffered:${tradeAggregationBuffer.size}`
-                );
-                lastWaitingLog = now;
-            }
+        const activity = localQueue.shift();
+        if (!activity) {
+            await new Promise((resolve) => setTimeout(resolve, 200));
             continue;
         }
 
         if (
             TRADE_AGGREGATION_ENABLED &&
-            trade.side === 'BUY' &&
-            (trade.usdcSize || 0) < TRADE_AGGREGATION_MIN_TOTAL_USD
+            activity.side === 'BUY' &&
+            (activity.usdcSize || 0) < TRADE_AGGREGATION_MIN_TOTAL_USD
         ) {
             Logger.info(
-                `[${workerLabel}] buffering $${(trade.usdcSize || 0).toFixed(2)} ${trade.side} for ${trade.slug || trade.asset}`
+                `[${workerLabel}] buffering $${(activity.usdcSize || 0).toFixed(2)} ${activity.side} for ${activity.slug || activity.asset}`
             );
-            addToAggregationBuffer(trade);
+            addToAggregationBuffer(activity);
             continue;
         }
 
         try {
-            await doTrading(clobClient, [trade], workerLabel);
+            await doTrading(clobClient, [activity], workerLabel);
         } catch (error) {
             Logger.error(`[${workerLabel}] Failed to execute trade: ${error}`);
         }
     }
-
-    Logger.info(`Trade executor worker #${workerId} stopped`);
 };
 
-export const stopTradeExecutor = () => {
-    isRunning = false;
-    broadcastShutdown();
-    for (const worker of workers) {
-        worker.terminate().catch(() => undefined);
-    }
-    workers.length = 0;
-    stopAggregationFlusher();
-    activityQueue.close();
-    
-    // Log final latency statistics
-    const stats = getLatencyStats();
-    if (stats) {
-        Logger.info('\n=== FINAL E2E LATENCY STATISTICS ===');
-        Logger.info(`Total trades: ${stats.count}`);
-        Logger.info(`Detection Latency (Monitor→Queue): min=${stats.detection.min.toFixed(2)}ms, p50=${stats.detection.p50.toFixed(2)}ms, p95=${stats.detection.p95.toFixed(2)}ms, p99=${stats.detection.p99.toFixed(2)}ms, max=${stats.detection.max.toFixed(2)}ms, avg=${stats.detection.avg.toFixed(2)}ms`);
-        Logger.info(`E2E Latency (Activity→Execution): min=${stats.e2e.min.toFixed(2)}ms, p50=${stats.e2e.p50.toFixed(2)}ms, p95=${stats.e2e.p95.toFixed(2)}ms, p99=${stats.e2e.p99.toFixed(2)}ms, max=${stats.e2e.max.toFixed(2)}ms, avg=${stats.e2e.avg.toFixed(2)}ms`);
-        Logger.info('====================================\n');
-    }
-    
-    Logger.info('Trade executor shutdown requested...');
+const start = async () => {
+    const clobClient = await createClobClient();
+    Logger.success(`Worker ${workerLabel} CLOB client ready`);
+    startAggregationFlusher(clobClient);
+    dequeueLoop(clobClient);
 };
 
-export const getE2ELatencyStats = () => getLatencyStats();
+if (!parentPort) {
+    throw new Error('executor worker must have parentPort');
+}
 
-const tradeExecutor = async (_clobClient: ClobClient) => {
-    isRunning = true;
-    Logger.success(`Trade executor orchestrator starting ${EXECUTOR_WORKERS} worker thread(s)`);
-
-    // Use .js in production (dist/) or .ts in development (src/)
-    const isDevelopment = __filename.endsWith('.ts');
-    const workerPath = isDevelopment 
-        ? path.join(__dirname, '../workers/executorWorker.ts')
-        : path.join(__dirname, '../workers/executorWorker.js');
-
-    for (let i = 0; i < EXECUTOR_WORKERS; i++) {
-        const workerId = i + 1;
-        const worker = new Worker(workerPath, {
-            workerData: { workerId },
-            execArgv: isDevelopment ? ['-r', 'ts-node/register'] : [],
-        });
-
-        worker.on('online', () => registerWorkerEndpoint(workerId, worker));
-        worker.on('exit', () => unregisterWorkerEndpoint(workerId));
-        worker.on('error', (err) => {
-            Logger.error(`Worker ${workerId} error: ${err}`);
-        });
-
-        workers.push(worker);
+parentPort.on('message', (message: any) => {
+    if (!message || typeof message !== 'object') return;
+    const { type, payload } = message;
+    if (type === 'activity' && payload) {
+        localQueue.push(payload as QueueActivity);
     }
-};
+    if (type === 'shutdown') {
+        isRunning = false;
+        stopAggregationFlusher();
+    }
+});
 
-export default tradeExecutor;
+start().catch((err) => {
+    Logger.error(`Worker ${workerLabel} failed to start: ${err}`);
+    process.exit(1);
+});

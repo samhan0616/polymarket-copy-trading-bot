@@ -1,7 +1,6 @@
 import * as dotenv from 'dotenv';
 dotenv.config();
 
-import connectDB, { closeDB } from '../config/db';
 import { performHealthCheck, logHealthCheck } from '../utils/healthCheck';
 import { ENV } from '../config/env';
 
@@ -24,15 +23,6 @@ function printHeader() {
 
 function printRecommendations(result: any) {
     const issues: string[] = [];
-
-    if (result.checks.database.status === 'error') {
-        issues.push('❌ Database Connection Failed');
-        console.log(`${colors.red}${colors.bright}\n📋 Database Issue:${colors.reset}`);
-        console.log('   • Check your MONGO_URI in .env file');
-        console.log('   • Verify MongoDB Atlas IP whitelist (allow 0.0.0.0/0)');
-        console.log('   • Ensure database user has correct permissions');
-        console.log('   • Test connection: https://www.mongodb.com/docs/atlas/troubleshoot-connection\n');
-    }
 
     if (result.checks.rpc.status === 'error') {
         issues.push('❌ RPC Endpoint Failed');
@@ -94,7 +84,6 @@ const main = async () => {
         printHeader();
         console.log(`${colors.yellow}⏳ Running diagnostic checks...${colors.reset}\n`);
 
-        await connectDB();
         const result = await performHealthCheck();
 
         logHealthCheck(result);
@@ -116,8 +105,6 @@ const main = async () => {
             console.error(error);
         }
         process.exit(1);
-    } finally {
-        await closeDB();
     }
 };
 

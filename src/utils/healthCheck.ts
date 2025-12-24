@@ -1,4 +1,3 @@
-import mongoose from 'mongoose';
 import { ENV } from '../config/env';
 import getMyBalance from './getMyBalance';
 import fetchData from './fetchData';
@@ -7,7 +6,6 @@ import Logger from './logger';
 export interface HealthCheckResult {
     healthy: boolean;
     checks: {
-        database: { status: 'ok' | 'error'; message: string };
         rpc: { status: 'ok' | 'error'; message: string };
         balance: { status: 'ok' | 'error' | 'warning'; message: string; balance?: number };
         polymarketApi: { status: 'ok' | 'error'; message: string };
@@ -20,34 +18,10 @@ export interface HealthCheckResult {
  */
 export const performHealthCheck = async (): Promise<HealthCheckResult> => {
     const checks: HealthCheckResult['checks'] = {
-        database: { status: 'error', message: 'Not checked' },
         rpc: { status: 'error', message: 'Not checked' },
         balance: { status: 'error', message: 'Not checked' },
         polymarketApi: { status: 'error', message: 'Not checked' },
     };
-
-    // Check MongoDB connection
-    try {
-        if (mongoose.connection.readyState === 1) {
-            // Ping the database
-            if (mongoose.connection.db) {
-                await mongoose.connection.db.admin().ping();
-                checks.database = { status: 'ok', message: 'Connected' };
-            } else {
-                checks.database = { status: 'error', message: 'Database object not available' };
-            }
-        } else {
-            checks.database = {
-                status: 'error',
-                message: `Connection state: ${mongoose.connection.readyState}`,
-            };
-        }
-    } catch (error) {
-        checks.database = {
-            status: 'error',
-            message: `Connection failed: ${error instanceof Error ? error.message : String(error)}`,
-        };
-    }
 
     // Check RPC endpoint
     try {
@@ -122,7 +96,6 @@ export const performHealthCheck = async (): Promise<HealthCheckResult> => {
 
     // Determine overall health
     const healthy =
-        checks.database.status === 'ok' &&
         checks.rpc.status === 'ok' &&
         checks.balance.status !== 'error' &&
         checks.polymarketApi.status === 'ok';
@@ -141,9 +114,6 @@ export const logHealthCheck = (result: HealthCheckResult): void => {
     Logger.separator();
     Logger.header('🏥 HEALTH CHECK');
     Logger.info(`Overall Status: ${result.healthy ? '✅ Healthy' : '❌ Unhealthy'}`);
-    Logger.info(
-        `Database: ${result.checks.database.status === 'ok' ? '✅' : '❌'} ${result.checks.database.message}`
-    );
     Logger.info(
         `RPC: ${result.checks.rpc.status === 'ok' ? '✅' : '❌'} ${result.checks.rpc.message}`
     );

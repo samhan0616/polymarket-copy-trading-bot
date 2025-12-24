@@ -73,6 +73,9 @@ const postOrder = async (
     user_balance: number,
     userAddress: string
 ) => {
+    const startTime = Date.now();
+    Logger.info(`[postOrder] Starting order placement...`);
+    
     const UserActivity = getUserActivityModel(userAddress);
     //Merge strategy
     if (condition === 'merge') {
@@ -246,8 +249,16 @@ const postOrder = async (
                 `Creating order: $${orderSize.toFixed(2)} @ $${minPriceAsk.price} (Balance: $${my_balance.toFixed(2)})`
             );
             // Order args logged internally
+            const orderCreationStart = Date.now();
             const signedOrder = await clobClient.createMarketOrder(order_arges);
+            const orderCreationLatency = Date.now() - orderCreationStart;
+            Logger.info(`[postOrder]   createMarketOrder: ${orderCreationLatency}ms`);
+            
+            const postOrderStart = Date.now();
             const resp = await clobClient.postOrder(signedOrder, OrderType.FOK);
+            const postOrderLatency = Date.now() - postOrderStart;
+            Logger.info(`[postOrder]   postOrder (to exchange): ${postOrderLatency}ms`);
+            
             if (resp.success === true) {
                 retry = 0;
                 const tokensBought = order_arges.amount / order_arges.price;
