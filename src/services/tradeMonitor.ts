@@ -11,6 +11,10 @@ if (!USER_ADDRESSES || USER_ADDRESSES.length === 0) {
     throw new Error('USER_ADDRESSES is not defined or empty');
 }
 
+// In-memory cache for positions: key -> {data, timestamp}
+// Expires after 1 minute
+const positionCache = new Map<string, { data: any; timestamp: number }>();
+
 // Create activity and position models for each user
 const userModels = USER_ADDRESSES.map((address) => ({
     address,
@@ -106,22 +110,30 @@ const init = async () => {
 };
 
 const fetchTradeData = async () => {
+    const overallStart = Date.now();
+
+    // Clean up expired cache entries (older than 1 minute)
+    const now = Date.now();
+    for (const [key, value] of positionCache) {
+        if (now - value.timestamp >= 60000) {
+            positionCache.delete(key);
+        }
+    }
+
     for (const { address, UserActivity, UserPosition } of userModels) {
+        const userStart = Date.now();
         try {
-            console.info('Trade timestamp:', new Date().toISOString());
             // Fetch trade activities from Polymarket API (last 1 minute)
             const startTs = Math.floor((Date.now() - 60000) / 1000); // 1 minute ago in seconds
             const apiUrl = `https://data-api.polymarket.com/activity?user=${address}&type=TRADE&sortBy=TIMESTAMP`;
-            console.info('Fetching URL:', apiUrl);  
+            const apiStart = Date.now();
             const activities = await fetchData(apiUrl);
-
-            console.info(`Fetched ${Array.isArray(activities) ? activities.length : 0} activities for ${address.slice(0, 6)}...${address.slice(-4)}`);
-
             if (!Array.isArray(activities) || activities.length === 0) {
                 continue;
             }
 
             // Process each activity
+            const processStart = Date.now();
             for (const activity of activities) {
                 // Skip if too old
                 // `TOO_OLD_SECONDS` is expressed in seconds (ENV). `activity.timestamp`
@@ -137,11 +149,11 @@ const fetchTradeData = async () => {
                     activityMs = isNaN(parsed) ? 0 : parsed;
                 }
                 const tooOldMs = TOO_OLD_SECONDS * 1000; // seconds -> ms
-                console.info('latency :', (nowMs - activityMs) / 1000, 'seconds');
                 if (activityMs === 0 || nowMs - activityMs > tooOldMs) {
                     // unknown timestamp or older than threshold
                     continue;
                 }
+                console.log('order cretated', (nowMs - activityMs) / 1000, 's ago');
                 // Check if this trade already exists in database
                 const existingActivity = await UserActivity.findOne({
                     transactionHash: activity.transactionHash,
@@ -185,42 +197,65 @@ const fetchTradeData = async () => {
 
             // Also fetch and update positions
             const positionsUrl = `https://data-api.polymarket.com/positions?user=${address}`;
+            const posApiStart = Date.now();
             const positions = await fetchData(positionsUrl);
 
             if (Array.isArray(positions) && positions.length > 0) {
+                const posProcessStart = Date.now();
+                const positionsToUpdate: any[] = [];
                 for (const position of positions) {
-                    // Update or create position
-                    await UserPosition.findOneAndUpdate(
-                        { asset: position.asset, conditionId: position.conditionId },
-                        {
-                            proxyWallet: position.proxyWallet,
-                            asset: position.asset,
-                            conditionId: position.conditionId,
-                            size: position.size,
-                            avgPrice: position.avgPrice,
-                            initialValue: position.initialValue,
-                            currentValue: position.currentValue,
-                            cashPnl: position.cashPnl,
-                            percentPnl: position.percentPnl,
-                            totalBought: position.totalBought,
-                            realizedPnl: position.realizedPnl,
-                            percentRealizedPnl: position.percentRealizedPnl,
-                            curPrice: position.curPrice,
-                            redeemable: position.redeemable,
-                            mergeable: position.mergeable,
-                            title: position.title,
-                            slug: position.slug,
-                            icon: position.icon,
-                            eventSlug: position.eventSlug,
-                            outcome: position.outcome,
-                            outcomeIndex: position.outcomeIndex,
-                            oppositeOutcome: position.oppositeOutcome,
-                            oppositeAsset: position.oppositeAsset,
-                            endDate: position.endDate,
-                            negativeRisk: position.negativeRisk,
-                        },
-                        { upsert: true }
-                    );
+                    const key = `${address}-${position.asset}-${position.conditionId}`;
+                    const cached = positionCache.get(key);
+                    const now = Date.now();
+                    let needsUpdate = true;
+                    if (cached && now - cached.timestamp < 60000) { // 1 minute
+                        // Check if data is the same
+                        if (JSON.stringify(cached.data) === JSON.stringify(position)) {
+                            needsUpdate = false;
+                        }
+                    }
+                    if (needsUpdate) {
+                        positionsToUpdate.push(position);
+                        positionCache.set(key, { data: position, timestamp: now });
+                    }
+                }
+                if (positionsToUpdate.length > 0) {
+                    const bulkOps = positionsToUpdate.map(position => ({
+                        updateOne: {
+                            filter: { asset: position.asset, conditionId: position.conditionId },
+                            update: {
+                                $set: {
+                                    proxyWallet: position.proxyWallet,
+                                    asset: position.asset,
+                                    conditionId: position.conditionId,
+                                    size: position.size,
+                                    avgPrice: position.avgPrice,
+                                    initialValue: position.initialValue,
+                                    currentValue: position.currentValue,
+                                    cashPnl: position.cashPnl,
+                                    percentPnl: position.percentPnl,
+                                    totalBought: position.totalBought,
+                                    realizedPnl: position.realizedPnl,
+                                    percentRealizedPnl: position.percentRealizedPnl,
+                                    curPrice: position.curPrice,
+                                    redeemable: position.redeemable,
+                                    mergeable: position.mergeable,
+                                    title: position.title,
+                                    slug: position.slug,
+                                    icon: position.icon,
+                                    eventSlug: position.eventSlug,
+                                    outcome: position.outcome,
+                                    outcomeIndex: position.outcomeIndex,
+                                    oppositeOutcome: position.oppositeOutcome,
+                                    oppositeAsset: position.oppositeAsset,
+                                    endDate: position.endDate,
+                                    negativeRisk: position.negativeRisk,
+                                }
+                            },
+                            upsert: true
+                        }
+                    }));
+                    await UserPosition.bulkWrite(bulkOps);
                 }
             }
         } catch (error) {
@@ -269,6 +304,7 @@ const tradeMonitor = async () => {
     }
 
     while (isRunning) {
+        const now = Date.now();
         await fetchTradeData();
         if (!isRunning) break;
         await new Promise((resolve) => setTimeout(resolve, FETCH_INTERVAL * 1000));
